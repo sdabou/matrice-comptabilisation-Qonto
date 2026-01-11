@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Qonto → Resto TVA (montant au débit)</title>
+  <title>Qonto → Écritures équilibrées (Fournisseur crédit, Charges/TVA débit)</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; line-height: 1.4; }
     .card { max-width: 980px; border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
@@ -14,14 +14,18 @@
     .muted { color:#666; font-size:13px; }
     .log { white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; border-radius:10px; margin-top:12px; }
     textarea { width:100%; min-height:140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>Qonto → Resto TVA + Compte (Web)</h1>
+    <h1>Qonto → Écritures équilibrées (Fournisseur au crédit)</h1>
     <p class="muted">
-      Export Qonto (TSV/Excel) → génère 3 blocs (banque / charge / TVA).<br>
-      Montants toujours en <b>Débit</b> (colonne F). Tout reste dans ton navigateur.
+      Génère <b>3 lignes par opération</b> (même séquence I) et garantit l'équilibre :
+      <br>• Fournisseur (<code>F…</code>) au <b>crédit</b> = TTC
+      <br>• Charge au <b>débit</b> = HT
+      <br>• TVA au <b>débit</b> = TTC − HT
+      <br><b>Important :</b> les arrondis sont faits de façon à assurer <b>HT + TVA = TTC</b> au centime près.
     </p>
 
     <label>Charger un fichier (xlsx/xls/csv/txt)</label>
@@ -42,12 +46,12 @@
       </div>
 
       <div style="min-width:220px; flex:1;">
-        <label>Compte de charge</label>
-        <input id="compte" type="text" value="6257000" />
+        <label>Compte de charge (débit)</label>
+        <input id="compte" type="text" value="6251000" />
       </div>
 
       <div style="min-width:220px; flex:1;">
-        <label>Compte TVA</label>
+        <label>Compte TVA (débit)</label>
         <input id="compteTVA" type="text" value="4456600" />
       </div>
     </div>
@@ -77,6 +81,11 @@
       return Number.isFinite(n) ? n : null;
     }
 
+    // Arrondi à 2 décimales (centime)
+    function round2(x) {
+      return Math.round((x + Number.EPSILON) * 100) / 100;
+    }
+
     function parseTSV(text) {
       const lines = text.split(/\r?\n/).map(l => l.trimEnd()).filter(l => l.trim() !== "");
       if (lines.length === 0) return null;
@@ -95,6 +104,32 @@
       });
     }
 
+    // TTC = max(Débit, Crédit). On travaille ensuite avec TTC arrondi à 2 décimales.
+    // Pour assurer l'équilibre: HT = arrondi( TTC / coef ), TVA = TTC - HT (puis arrondi sécurité).
+    function computeHTTVA(ttc, taux) {
+      const ttc2 = round2(ttc);
+
+      if (taux === 0) {
+        return { ttc2, ht2: ttc2, tva2: 0 };
+      }
+
+      const coef = 1 + (taux / 100);
+      const ht2 = round2(ttc2 / coef);
+      // TVA = différence pour garantir HT + TVA = TTC
+      const tva2 = round2(ttc2 - ht2);
+
+      // Sécurité : si un 0.01 traîne à cause d'arrondis binaires, on recale TVA
+      const diff = round2((ht2 + tva2) - ttc2);
+      if (diff !== 0) {
+        // on corrige TVA du diff inverse
+        return { ttc2, ht2, tva2: round2(tva2 - diff) };
+      }
+
+      return { ttc2, ht2, tva2 };
+    }
+
+    // Colonnes attendues (0-index):
+    // 0 Date | 1 Journal | 2 Compte (souvent Fxxxx) | 3 Pièce | 4 Libellé | 5 Débit | 6 Crédit | 7 Statut | 8 Séquence
     function transformQonto(rows, taux, compteCharge, compteTVA) {
       const n = rows.length;
 
@@ -104,48 +139,37 @@
         return rr.slice(0, 9);
       });
 
-      for (let i = 0; i < n; i++) {
-        const lib = String(base[i][4] ?? "");
-        base[i][4] = lib.replace(/CARTE\s*/gi, "").trim();
-        base[i][1] = "ac";
-        base[i][3] = "TICKET";
-      }
+      const out = [];
+      let skipped = 0;
 
-      const TTC = new Array(n).fill(0);
       for (let i = 0; i < n; i++) {
+        const seq = i + 1; // 1..n
+        const date = base[i][0];
+        const compteF = String(base[i][2] ?? "").trim();
+        const piece = "TICKET";
+        const statut = base[i][7] ?? "E";
+
+        const lib = String(base[i][4] ?? "").replace(/CARTE\s*/gi, "").trim();
+
         const debit = normalizeNumber(base[i][5]) ?? 0;
         const credit = normalizeNumber(base[i][6]) ?? 0;
         const ttc = Math.max(debit, credit);
-        TTC[i] = ttc;
-        base[i][5] = ttc === 0 ? "" : ttc;
-        base[i][6] = "";
-        base[i][8] = (i % 2 === 0) ? 1 : 2;
+
+        if (!ttc || ttc === 0) { skipped++; continue; }
+
+        const { ttc2, ht2, tva2 } = computeHTTVA(ttc, taux);
+
+        // Fournisseur AU CREDIT = TTC
+        out.push([date, "ac", compteF, piece, lib, "", ttc2, statut, seq]);
+
+        // Charge AU DEBIT = HT
+        out.push([date, "ac", compteCharge, piece, lib, ht2, "", statut, seq]);
+
+        // TVA AU DEBIT = TVA (diff)
+        out.push([date, "ac", compteTVA, piece, lib, tva2, "", statut, seq]);
       }
 
-      const coef = (taux === 0) ? 1 : (1 + taux / 100);
-
-      const charges = base.map(r => r.slice());
-      for (let i = 0; i < n; i++) {
-        charges[i][2] = compteCharge;
-        const ttc = TTC[i];
-        const ht = (taux === 0) ? ttc : (ttc / coef);
-        charges[i][5] = ttc === 0 ? "" : ht;
-        charges[i][6] = "";
-      }
-
-      const tvaBloc = base.map(r => r.slice());
-      for (let i = 0; i < n; i++) {
-        tvaBloc[i][2] = compteTVA;
-        const ttc = TTC[i];
-        const ht = (taux === 0) ? ttc : (ttc / coef);
-        const tva = (taux === 0) ? 0 : (ttc - ht);
-        tvaBloc[i][5] = ttc === 0 ? "" : tva;
-        tvaBloc[i][6] = "";
-      }
-
-      const out = [...base, ...charges, ...tvaBloc];
-      out.sort((a, b) => (normalizeNumber(a[8]) ?? 0) - (normalizeNumber(b[8]) ?? 0));
-      return out;
+      return { outRows: out, skipped };
     }
 
     let fileData = null;
@@ -218,20 +242,22 @@
         }
 
         log("Transformation…");
-        const outRows = transformQonto(rows, taux, compte, compteTVA);
+        const { outRows, skipped } = transformQonto(rows, taux, compte, compteTVA);
+        assert(outRows.length > 0, "Aucune ligne générée (montants à 0 ?).");
 
         const outWb = XLSX.utils.book_new();
         const outWs = XLSX.utils.aoa_to_sheet(outRows);
         XLSX.utils.book_append_sheet(outWb, outWs, "RESULTAT");
 
         const baseName = (fileData?.originalName || "Qonto").replace(/\.(xlsx|xls|csv|txt)$/i, "");
-        const outName = `${baseName}_TRAITE_TVA_${String(taux).replace(".", "_")}.xlsx`;
+        const outName = `${baseName}_ECRITURES_EQUILIBREES_TVA_${String(taux).replace(".", "_")}.xlsx`;
 
         XLSX.writeFile(outWb, outName);
 
         log("Terminé ✅");
-        log(`Taux: ${taux}% | Compte charge: ${compte} | Compte TVA: ${compteTVA}`);
-        log(`Sortie: ${outRows.length} ligne(s).`);
+        log(`Taux: ${taux}% | Charge (débit): ${compte} | TVA (débit): ${compteTVA}`);
+        log(`Sortie: ${outRows.length} ligne(s) (3 lignes par opération).`);
+        if (skipped) log(`Lignes ignorées (TTC=0): ${skipped}`);
       } catch (err) {
         alert(err?.message || String(err));
       }
