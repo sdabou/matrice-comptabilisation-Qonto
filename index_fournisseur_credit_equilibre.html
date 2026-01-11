@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Qonto → Écritures équilibrées (Fournisseur crédit, Charges/TVA débit)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; line-height: 1.4; }
+    .card { max-width: 980px; border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    label { display:block; font-weight:600; margin-top:12px; }
+    input, select, button, textarea { padding:10px; border-radius:10px; border:1px solid #ccc; font-size:14px; }
+    button { cursor:pointer; }
+    .muted { color:#666; font-size:13px; }
+    .log { white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding:12px; border-radius:10px; margin-top:12px; }
+    textarea { width:100%; min-height:140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Qonto → Écritures équilibrées (Fournisseur au crédit)</h1>
+    <p class="muted">
+      Génère <b>3 lignes par opération</b> (même séquence I) et garantit l'équilibre :
+      <br>• Fournisseur (<code>F…</code>) au <b>crédit</b> = TTC
+      <br>• Charge au <b>débit</b> = HT
+      <br>• TVA au <b>débit</b> = TTC − HT
+      <br><b>Important :</b> les arrondis sont faits de façon à assurer <b>HT + TVA = TTC</b> au centime près.
+    </p>
+
+    <label>Charger un fichier (xlsx/xls/csv/txt)</label>
+    <input id="file" type="file" accept=".xlsx,.xls,.csv,.txt" />
+
+    <p class="muted">Ou colle directement ton export Qonto (format tabulé) :</p>
+    <textarea id="paste" placeholder="Colle ici quelques lignes de l’export Qonto (TSV)"></textarea>
+
+    <div class="row">
+      <div style="min-width:220px; flex:1;">
+        <label>Taux de TVA</label>
+        <select id="taux">
+          <option value="0">0%</option>
+          <option value="5.5" selected>5,5%</option>
+          <option value="10">10%</option>
+          <option value="20">20%</option>
+        </select>
+      </div>
+
+      <div style="min-width:220px; flex:1;">
+        <label>Compte de charge (débit)</label>
+        <input id="compte" type="text" value="6251000" />
+      </div>
+
+      <div style="min-width:220px; flex:1;">
+        <label>Compte TVA (débit)</label>
+        <input id="compteTVA" type="text" value="4456600" />
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:14px;">
+      <button id="run" disabled>Transformer & télécharger</button>
+    </div>
+
+    <div id="log" class="log" style="display:none;"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logBox = $("log");
+
+    function log(msg) { logBox.style.display = "block"; logBox.textContent += msg + "\n"; }
+    function resetLog() { logBox.textContent = ""; logBox.style.display = "none"; }
+    function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+    function normalizeNumber(v) {
+      if (v === null || v === undefined || v === "") return null;
+      if (typeof v === "number") return Number.isFinite(v) ? v : null;
+      const s = String(v).trim().replace(/\s+/g, "").replace(",", ".");
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    // Arrondi à 2 décimales (centime)
+    function round2(x) {
+      return Math.round((x + Number.EPSILON) * 100) / 100;
+    }
+
+    function parseTSV(text) {
+      const lines = text.split(/\r?\n/).map(l => l.trimEnd()).filter(l => l.trim() !== "");
+      if (lines.length === 0) return null;
+
+      const splitLine = (line) => {
+        if (line.includes("\t")) return line.split("\t");
+        if (line.includes(";")) return line.split(";");
+        if (line.includes(",")) return line.split(",");
+        return line.split(/\s+/);
+      };
+
+      return lines.map(l => {
+        const r = splitLine(l);
+        while (r.length < 9) r.push("");
+        return r.slice(0, 9);
+      });
+    }
+
+    // TTC = max(Débit, Crédit). On travaille ensuite avec TTC arrondi à 2 décimales.
+    // Pour assurer l'équilibre: HT = arrondi( TTC / coef ), TVA = TTC - HT (puis arrondi sécurité).
+    function computeHTTVA(ttc, taux) {
+      const ttc2 = round2(ttc);
+
+      if (taux === 0) {
+        return { ttc2, ht2: ttc2, tva2: 0 };
+      }
+
+      const coef = 1 + (taux / 100);
+      const ht2 = round2(ttc2 / coef);
+      // TVA = différence pour garantir HT + TVA = TTC
+      const tva2 = round2(ttc2 - ht2);
+
+      // Sécurité : si un 0.01 traîne à cause d'arrondis binaires, on recale TVA
+      const diff = round2((ht2 + tva2) - ttc2);
+      if (diff !== 0) {
+        // on corrige TVA du diff inverse
+        return { ttc2, ht2, tva2: round2(tva2 - diff) };
+      }
+
+      return { ttc2, ht2, tva2 };
+    }
+
+    // Colonnes attendues (0-index):
+    // 0 Date | 1 Journal | 2 Compte (souvent Fxxxx) | 3 Pièce | 4 Libellé | 5 Débit | 6 Crédit | 7 Statut | 8 Séquence
+    function transformQonto(rows, taux, compteCharge, compteTVA) {
+      const n = rows.length;
+
+      const base = rows.map(r => {
+        const rr = Array.isArray(r) ? r.slice() : [];
+        while (rr.length < 9) rr.push("");
+        return rr.slice(0, 9);
+      });
+
+      const out = [];
+      let skipped = 0;
+
+      for (let i = 0; i < n; i++) {
+        const seq = i + 1; // 1..n
+        const date = base[i][0];
+        const compteF = String(base[i][2] ?? "").trim();
+        const piece = "TICKET";
+        const statut = base[i][7] ?? "E";
+
+        const lib = String(base[i][4] ?? "").replace(/CARTE\s*/gi, "").trim();
+
+        const debit = normalizeNumber(base[i][5]) ?? 0;
+        const credit = normalizeNumber(base[i][6]) ?? 0;
+        const ttc = Math.max(debit, credit);
+
+        if (!ttc || ttc === 0) { skipped++; continue; }
+
+        const { ttc2, ht2, tva2 } = computeHTTVA(ttc, taux);
+
+        // Fournisseur AU CREDIT = TTC
+        out.push([date, "ac", compteF, piece, lib, "", ttc2, statut, seq]);
+
+        // Charge AU DEBIT = HT
+        out.push([date, "ac", compteCharge, piece, lib, ht2, "", statut, seq]);
+
+        // TVA AU DEBIT = TVA (diff)
+        out.push([date, "ac", compteTVA, piece, lib, tva2, "", statut, seq]);
+      }
+
+      return { outRows: out, skipped };
+    }
+
+    let fileData = null;
+
+    function enableRun() {
+      const hasPaste = $("paste").value.trim().length > 0;
+      $("run").disabled = !(hasPaste || fileData);
+    }
+
+    $("paste").addEventListener("input", () => { fileData = null; enableRun(); });
+
+    $("file").addEventListener("change", async (e) => {
+      resetLog();
+      const f = e.target.files?.[0];
+      if (!f) return;
+
+      $("paste").value = "";
+      $("run").disabled = true;
+      log("Lecture du fichier…");
+
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const sheetName = wb.SheetNames[0];
+      assert(sheetName, "Aucune feuille trouvée.");
+      const ws = wb.Sheets[sheetName];
+      let rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+
+      while (rows.length > 0) {
+        const last = rows[rows.length - 1];
+        const empty = !last || last.every(v => v === null || v === undefined || String(v).trim() === "");
+        if (!empty) break;
+        rows.pop();
+      }
+      assert(rows.length > 0, "Le fichier ne contient aucune ligne exploitable.");
+
+      fileData = { rows, originalName: f.name, sheetName };
+      log(`OK. ${rows.length} ligne(s) détectée(s) sur "${sheetName}".`);
+      enableRun();
+    });
+
+    $("run").addEventListener("click", () => {
+      try {
+        resetLog();
+
+        const taux = Number(String($("taux").value).replace(",", "."));
+        let compte = $("compte").value.replace(/[^\d]/g, "");
+        let compteTVA = $("compteTVA").value.replace(/[^\d]/g, "");
+
+        $("compte").value = compte;
+        $("compteTVA").value = compteTVA;
+
+        assert([0, 5.5, 10, 20].includes(taux), "Taux TVA invalide.");
+        assert(compte.length >= 6, "Compte charge invalide (>= 6 chiffres).");
+        assert(compteTVA.length >= 6, "Compte TVA invalide (>= 6 chiffres).");
+
+        let rows = null;
+        const pasted = $("paste").value.trim();
+        if (pasted.length > 0) {
+          rows = parseTSV(pasted);
+          assert(rows && rows.length > 0, "Collage inexploitable.");
+          log(`Collage : ${rows.length} ligne(s).`);
+        } else {
+          assert(fileData, "Aucun fichier chargé.");
+          rows = fileData.rows.map(r => {
+            const rr = Array.isArray(r) ? r.slice() : [];
+            while (rr.length < 9) rr.push("");
+            return rr.slice(0, 9);
+          });
+          log(`Fichier : ${rows.length} ligne(s).`);
+        }
+
+        log("Transformation…");
+        const { outRows, skipped } = transformQonto(rows, taux, compte, compteTVA);
+        assert(outRows.length > 0, "Aucune ligne générée (montants à 0 ?).");
+
+        const outWb = XLSX.utils.book_new();
+        const outWs = XLSX.utils.aoa_to_sheet(outRows);
+        XLSX.utils.book_append_sheet(outWb, outWs, "RESULTAT");
+
+        const baseName = (fileData?.originalName || "Qonto").replace(/\.(xlsx|xls|csv|txt)$/i, "");
+        const outName = `${baseName}_ECRITURES_EQUILIBREES_TVA_${String(taux).replace(".", "_")}.xlsx`;
+
+        XLSX.writeFile(outWb, outName);
+
+        log("Terminé ✅");
+        log(`Taux: ${taux}% | Charge (débit): ${compte} | TVA (débit): ${compteTVA}`);
+        log(`Sortie: ${outRows.length} ligne(s) (3 lignes par opération).`);
+        if (skipped) log(`Lignes ignorées (TTC=0): ${skipped}`);
+      } catch (err) {
+        alert(err?.message || String(err));
+      }
+    });
+
+    enableRun();
+  </script>
+</body>
+</html>
